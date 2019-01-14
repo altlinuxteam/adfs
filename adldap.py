@@ -93,6 +93,11 @@ class AD(object):
         return ret.pdc_dns_name
 
 
+    def apply_diff(self, dn, diff):
+        log.debug('applying diff: %s' % diff)
+        self.l.modify_s(dn, diff)
+
+
     def __init_samba_params(self, root_use_machine_creds = True):
         lp = samba.param.LoadParm()
         try:

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, stat, errno, signal, logging, pyfuse3, trio
+import os, io, sys, stat, errno, signal, logging, pyfuse3, trio
 import stat
 from time import time
 import sqlite3
 from argparse import ArgumentParser
 from adldap import AD
 import ldif
+import ldap.modlist as modlist
+
 
 try:
     import faulthandler
@@ -288,8 +290,11 @@ class ADfs(pyfuse3.Operations):
             data_bytes = str(data).encode()
 #            log.debug('data_bytes: %s' % data_bytes.decode('utf-8'))
             node_dn = self.get_inode_dn(inode)
-            data_ldif = ldif.CreateLDIF(node_dn, dict(data))
-            data_out = ('# DN: %s\n%s' % (node_dn, data_ldif)).encode()
+            data_ldif = io.StringIO()
+            lwr = ldif.LDIFWriter(data_ldif)
+            lwr.unparse(node_dn, dict(data))
+#            ldif.CreateLDIF(node_dn, dict(data))
+            data_out = ('# DN: %s\n%s' % (node_dn, data_ldif.getvalue())).encode()
             self.db.execute("UPDATE inodes SET data=? WHERE id=?", (data_out, inode))
             return len(data_out)
 
@@ -306,15 +311,31 @@ class ADfs(pyfuse3.Operations):
         return data[off:off+length]
 
 
-#    async def write(self, fh, offset, buf):
-#        data = self.get_row('SELECT data FROM inodes WHERE id=?', (fh,))[0]
-#        if data is None:
-#            data = b''
-#        data = data[:offset] + buf + data[offset+len(buf):]
-#
-#        self.cursor.execute('UPDATE inodes SET data=?, size=? WHERE id=?',
-#                            (memoryview(data), len(data), fh))
-#        return len(buf)
+    async def write(self, fh, offset, buf):
+        log.debug("write (fh, offset, buf) (%s, %s, %s)" % (fh, offset, buf))
+        data_old = self.get_row('SELECT data FROM inodes WHERE id=?', (fh,))[0]
+        log.debug("old len: %s" % len(data_old))
+        log.debug("buf len: %s" % len(buf))
+        if data_old is None:
+            data_new = b''
+
+        # TODO: check that we replace whole data_old but not edit by chunks
+        data_new = buf
+#        data_new = data_old[:offset] + buf + data_old[offset+len(buf):]
+        log.debug("data_new: %s" % data_new)
+
+        dn = self.get_inode_dn(fh)
+        dict_old = ldif.LDIFRecordList(io.StringIO(data_old.decode('utf-8')))
+        dict_old.parse()
+        log.debug("dict_old: %s" % dict_old.all_records)
+        dict_new = ldif.LDIFRecordList(io.StringIO(data_new.decode('utf-8')))
+        dict_new.parse()
+        log.debug("dict_new: %s" % dict_new.all_records)
+        _ldif = modlist.modifyModlist(dict_old.all_records[0][1], dict_new.all_records[0][1])
+        log.debug("_ldif: %s" % _ldif)
+        self.ad.apply_diff(dn, _ldif)
+        self.update_inode_data(fh)
+        return len(buf)
 
 
 def init_logging(debug=False):
