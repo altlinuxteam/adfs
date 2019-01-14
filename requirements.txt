@@ -1,0 +1,2 @@
+pyfuse3 >= 1.2
+python-ldap
