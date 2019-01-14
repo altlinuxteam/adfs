@@ -268,6 +268,15 @@ class ADfs(pyfuse3.Operations):
         return inode
 
 
+    def get_inode_dn(self, inode):
+        iname = self.get_inode_name(inode)
+        log.debug('iname: %s' % iname)
+        if iname == b'.attributes':
+            return self.path2dn(self.get_inode_path(inode))[len('.attributes')+1:]
+        else:
+            return self.path2dn(self.get_inode_path(inode))
+
+
     def update_inode_data(self, inode):
         name = self.get_inode_name(inode)
         data = None
@@ -278,9 +287,11 @@ class ADfs(pyfuse3.Operations):
         if data:
             data_bytes = str(data).encode()
 #            log.debug('data_bytes: %s' % data_bytes.decode('utf-8'))
-            data_ldif = ldif.CreateLDIF('DC=test', dict(data)).encode()
-            self.db.execute("UPDATE inodes SET data=? WHERE id=?", (data_ldif, inode))
-            return len(data_ldif)
+            node_dn = self.get_inode_dn(inode)
+            data_ldif = ldif.CreateLDIF(node_dn, dict(data))
+            data_out = ('# DN: %s\n%s' % (node_dn, data_ldif)).encode()
+            self.db.execute("UPDATE inodes SET data=? WHERE id=?", (data_out, inode))
+            return len(data_out)
 
         return 0
 
@@ -293,6 +304,17 @@ class ADfs(pyfuse3.Operations):
 
         log.debug('data is: %s' % data)
         return data[off:off+length]
+
+
+#    async def write(self, fh, offset, buf):
+#        data = self.get_row('SELECT data FROM inodes WHERE id=?', (fh,))[0]
+#        if data is None:
+#            data = b''
+#        data = data[:offset] + buf + data[offset+len(buf):]
+#
+#        self.cursor.execute('UPDATE inodes SET data=?, size=? WHERE id=?',
+#                            (memoryview(data), len(data), fh))
+#        return len(buf)
 
 
 def init_logging(debug=False):
