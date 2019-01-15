@@ -34,8 +34,8 @@ def r2dn(r):
     return ','.join(['DC=%s' % x for x in r.lower().split('.')])
 
 class ADfs(pyfuse3.Operations):
-    def path2dn(self, path):
-        return (self.realm)
+#    def path2dn(self, path):
+#        return (self.realm)
 
 
     def __init__(self):
@@ -124,6 +124,18 @@ class ADfs(pyfuse3.Operations):
             cursor2.execute("INSERT INTO inodes (uid, gid, mode, mtime_ns, atime_ns, ctime_ns, target, rdev) "
                             "VALUES (?,?,?,?,?,?,?,?)",
                             (os.getuid(), os.getgid(), stat.S_IFREG | 0o644, now_ns, now_ns, now_ns, None, 0))
+            attrs_inode = cursor2.lastrowid
+            log.debug("insert new record: (name, inode, parent_inode) (%s, %s, %s)" % (name, attrs_inode, inode))
+            self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (name, attrs_inode, inode))
+            data_len = self.update_inode_data(attrs_inode)
+            self.db.execute("UPDATE inodes SET size=? WHERE id=?", (data_len, attrs_inode))
+
+            # insert schema definitions for class
+            log.debug("add schema definition to %s" % pdn)
+            name = b'.schema'
+            cursor2.execute("INSERT INTO inodes (uid, gid, mode, mtime_ns, atime_ns, ctime_ns, target, rdev) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (os.getuid(), os.getgid(), stat.S_IFREG | 0o444, now_ns, now_ns, now_ns, None, 0))
             attrs_inode = cursor2.lastrowid
             log.debug("insert new record: (name, inode, parent_inode) (%s, %s, %s)" % (name, attrs_inode, inode))
             self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (name, attrs_inode, inode))
@@ -275,6 +287,8 @@ class ADfs(pyfuse3.Operations):
         log.debug('iname: %s' % iname)
         if iname == b'.attributes':
             return self.path2dn(self.get_inode_path(inode))[len('.attributes')+1:]
+        elif iname == b'.schema':
+            return self.path2dn(self.get_inode_path(inode))[len('.schema')+1:]
         else:
             return self.path2dn(self.get_inode_path(inode))
 
@@ -286,15 +300,32 @@ class ADfs(pyfuse3.Operations):
         if name == b'.attributes':
             dn = self.path2dn(self.get_inode_path(inode))[len(name)+1:]
             data = self.ad.read_node(dn)
-        if data:
-            data_bytes = str(data).encode()
-#            log.debug('data_bytes: %s' % data_bytes.decode('utf-8'))
-            node_dn = self.get_inode_dn(inode)
             data_ldif = io.StringIO()
             lwr = ldif.LDIFWriter(data_ldif)
-            lwr.unparse(node_dn, dict(data))
-#            ldif.CreateLDIF(node_dn, dict(data))
-            data_out = ('# DN: %s\n%s' % (node_dn, data_ldif.getvalue())).encode()
+            lwr.unparse(dn, dict(data))
+            data = data_ldif.getvalue()
+        elif name == b'.schema':
+            data = []
+            dn = self.path2dn(self.get_inode_path(inode))[len(name)+1:]
+            log.debug("determine attributes of %s" % dn)
+            obj_classes = self.ad.get_object_classes(dn)
+            log.debug("classes for %s: %s" % (dn, obj_classes))
+            ocs = map(lambda x: str(x, 'utf-8'), obj_classes)
+            oc_attrs = self.ad.schema.attribute_types(ocs)
+            must_attrs = oc_attrs[0]
+            may_attrs = oc_attrs[1]
+            data.append('\n# MUST HAVE attributes')
+            for ( oid, attr_obj ) in must_attrs.items():
+                data.append('%s' % attr_obj.names[0])
+
+            data.append('\n# MAY HAVE attributes')
+            for ( oid, attr_obj ) in may_attrs.items():
+                data.append('%s' % attr_obj.names[0])
+
+            data = '\n'.join(data)
+
+        if data:
+            data_out = ('# DN: %s\n%s' % (dn, data)).encode()
             self.db.execute("UPDATE inodes SET data=? WHERE id=?", (data_out, inode))
             return len(data_out)
 

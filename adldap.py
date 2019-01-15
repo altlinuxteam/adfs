@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os, sys, errno, logging
-import ldap, ldap.sasl
+import ldap, ldap.sasl, ldap.schema
 from argparse import ArgumentParser
 from logging import debug, info, warning
 # samba imports
@@ -38,6 +38,19 @@ class AD(object):
         auth_tokens = ldap.sasl.gssapi('')
         self.l.sasl_interactive_bind_s('', auth_tokens)
         self.l.set_option(ldap.OPT_REFERRALS,0)
+        # init subschema
+        sub_dn = self.l.search_subschemasubentry_s(r2dn(self.realm))
+        sub_entry = self.l.read_subschemasubentry_s(sub_dn, ldap.schema.SCHEMA_ATTRS)
+        self.schema =  ldap.schema.SubSchema(sub_entry)
+
+
+    def get_object_classes(self, dn):
+        (_, res) = self.ldap_search(dn=dn, scope=ldap.SCOPE_BASE, attrs=['objectClass'])[0]
+        log.debug('get_object_classes: %s' % res)
+        if not res:
+            return []
+        else:
+            return res['objectClass']
 
 
     def get_childs(self, dn):
