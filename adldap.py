@@ -76,6 +76,12 @@ class AD(object):
         return res
 
 
+    def delete_node(self, dn):
+        self.l.delete_s(dn)
+        log.debug("%s deleted" % dn)
+       #log.debug("delete %s: %s" % (dn, self.l.result()))
+
+
     def ldap_search(self, dn=None, expr=None, scope=ldap.SCOPE_SUBTREE, attrs=[]):
         if not dn:
             dn = self.base_dn

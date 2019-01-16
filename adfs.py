@@ -72,6 +72,15 @@ class ADfs(pyfuse3.Operations):
                 self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (dn, inode, pyfuse3.ROOT_INODE))
 
 
+    def get_node_dn(self, inode_p, name):
+        inode = self.get_row("SELECT inode FROM contents WHERE parent_inode=? AND name=?", (inode_p, name))['inode']
+        path = self.get_inode_path(inode)
+        if name == b'.attributes' or name == b'.schema':
+            return self.path2dn(path)[len(name)+1:]
+        else:
+            return self.path2dn(path)
+
+
     def get_inode_name(self, inode):
         return self.get_row("SELECT name FROM contents WHERE inode=?", (inode,))['name']
 
@@ -102,14 +111,28 @@ class ADfs(pyfuse3.Operations):
             self._update_root()
 
 
-    def update_inode(self, inode):
+    def update_inode(self, inode, force=False, delete_self_node=False):
         if inode == pyfuse3.ROOT_INODE:
             self._update_root()
             return
 
+        if force:
+#            inodes = self.db.execute("SELECT inode FROM contents WHERE parent_inode=?", (inode,)).fetchone()
+#            log.debug("force deliting nodes: %s" % list(inodes))
+            self.db.execute("DELETE FROM inodes WHERE id IN (SELECT inode FROM contents WHERE parent_inode=?)", (inode,))
+            self.db.execute("DELETE FROM contents WHERE parent_inode=?", (inode,))
+            if delete_self_node:
+                self.db.execute("DELETE FROM inodes WHERE id=?", (inode,))
+                self.db.execute("DELETE FROM contents WHERE inode=?", (inode,))
+
+            childs = []
+        else:
+            childs = self.db.execute("SELECT * FROM contents WHERE parent_inode=?", (inode,)).fetchone()
+
+#            self.db.execute(query, inodes)
+
         # try to get children from cache
-        childs = self.db.execute("SELECT * FROM contents WHERE parent_inode=?", (inode,)).fetchone()
-        if not childs: # update cache from AD
+        if not childs and not delete_self_node: # update cache from AD
             cwd = self.get_inode_path(inode)
             log.debug('cwd: %s' % cwd)
             pdn = self.path2dn(cwd) # parent dn
@@ -153,7 +176,7 @@ class ADfs(pyfuse3.Operations):
                 log.debug("insert new record: (name, inode, parent_inode) (%s, %s, %s)" % (name, c_inode, inode))
                 self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (name, c_inode, inode))
         else:
-            log.debug("skip updating %s" % self.get_inode_name(inode))
+            log.debug("skip updating %s" % inode)
 
 
     def init_tables(self):
@@ -195,6 +218,7 @@ class ADfs(pyfuse3.Operations):
         self.cursor.execute("INSERT INTO contents (name, parent_inode, inode) VALUES(?,?,?)",
                             (b'..', pyfuse3.ROOT_INODE, pyfuse3.ROOT_INODE))
 
+        # node for configuration branch
         self.cursor.execute("INSERT INTO inodes (mode,uid,gid,mtime_ns,atime_ns,ctime_ns) "
                             "VALUES (?,?,?,?,?,?) ",
                             (stat.S_IFDIR | 0o755,
@@ -221,7 +245,10 @@ class ADfs(pyfuse3.Operations):
 
 
     async def getattr(self, inode, ctx=None):
-        row = self.get_row("SELECT * FROM inodes WHERE id=?", (inode,))
+        try:
+            row = self.get_row("SELECT * FROM inodes WHERE id=?", (inode,))
+        except NoSuchRowError:
+            raise(pyfuse3.FUSEError(errno.ENOENT))
 
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
@@ -270,7 +297,11 @@ class ADfs(pyfuse3.Operations):
         if off == 0:
             off = -1
 
-        self.update_inode(inode)
+        try:
+            self.update_inode(inode)
+        except NoSuchRowError:
+            raise(pyfuse3.FUSEError(errno.ENOENT))
+
         cursor2 = self.db.cursor()
         cursor2.execute("SELECT * FROM contents WHERE parent_inode=? AND rowid > ? ORDER BY rowid", (inode,off))
         for row in cursor2:
@@ -317,7 +348,6 @@ class ADfs(pyfuse3.Operations):
             data.append('\n# MUST HAVE attributes')
             for ( oid, attr_obj ) in must_attrs.items():
                 data.append('%s' % attr_obj.names[0])
-
             data.append('\n# MAY HAVE attributes')
             for ( oid, attr_obj ) in may_attrs.items():
                 data.append('%s' % attr_obj.names[0])
@@ -367,6 +397,48 @@ class ADfs(pyfuse3.Operations):
         self.ad.apply_diff(dn, _ldif)
         self.update_inode_data(fh)
         return len(buf)
+
+
+    async def unlink(self, inode_p, name,ctx):
+        entry = await self.lookup(inode_p, name)
+
+        if stat.S_ISDIR(entry.st_mode):
+            raise pyfuse3.FUSEError(errno.EISDIR)
+
+        self._remove(inode_p, name, entry)
+
+
+    async def rmdir(self, inode_p, name, ctx):
+        log.debug("rmdir for %s" % name)
+        entry = await self.lookup(inode_p, name)
+
+        if not stat.S_ISDIR(entry.st_mode):
+            raise pyfuse3.FUSEError(errno.ENOTDIR)
+
+        self._remove(inode_p, name, entry)
+
+
+    def _remove(self, inode_p, name, entry):
+        if name == b'.attributes':
+            try:
+                dn = self.get_node_dn(inode_p, name)
+                log.debug("going to delete %s" % dn)
+                self.ad.delete_node(dn)
+            except Exception as e:
+                log.error("cannot delete DN: %s (%s)" % (dn,e))
+                raise pyfuse3.FUSEError(errno.EIO)
+            self.update_inode(inode_p, force=True, delete_self_node=True)
+
+        if self.get_row("SELECT COUNT(inode) FROM contents WHERE parent_inode=?",
+                        (entry.st_ino,))[0] > 0:
+            raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+
+        self.cursor.execute("DELETE FROM contents WHERE name=? AND parent_inode=?",
+                            (name, inode_p))
+
+        self.cursor.execute("DELETE FROM inodes WHERE id=?", (entry.st_ino,))
+#        if entry.st_nlink == 1 and entry.st_ino not in self.inode_open_count:
+#            self.cursor.execute("DELETE FROM inodes WHERE id=?", (entry.st_ino,))
 
 
 def init_logging(debug=False):
