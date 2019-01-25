@@ -19,8 +19,14 @@ def r2dn(r):
 
 
 class AD(object):
+    WKDN = {'configuration': 'CN=Configuration',
+            'schema': 'CN=Schema,CN=Configuration'
+    }
     def __init__(self, realm):
         self.realm = realm
+        self.realmDN = r2dn(self.realm)
+        self.WKDN = dict((k,'%s,%s' % (v,self.realmDN)) for k, v in self.WKDN.items())
+        self.WKDN['realm'] = self.realmDN
         debug("initialize LDAP")
         self.__init_samba_params()
         self.__init_ldap()
@@ -38,10 +44,26 @@ class AD(object):
         auth_tokens = ldap.sasl.gssapi('')
         self.l.sasl_interactive_bind_s('', auth_tokens)
         self.l.set_option(ldap.OPT_REFERRALS,0)
+        self.l.set_option(ldap.OPT_X_KEEPALIVE_IDLE, 30)
+        self.l.set_option(ldap.OPT_X_KEEPALIVE_INTERVAL, 10)
+        self.l.set_option(ldap.OPT_X_KEEPALIVE_PROBES, 3)
         # init subschema
-        sub_dn = self.l.search_subschemasubentry_s(r2dn(self.realm))
+        sub_dn = self.l.search_subschemasubentry_s(self.realmDN)
         sub_entry = self.l.read_subschemasubentry_s(sub_dn, ldap.schema.SCHEMA_ATTRS)
         self.schema =  ldap.schema.SubSchema(sub_entry)
+
+
+    def get_category_schema(self, dn):
+        (_, cat) = self.ldap_search(dn=dn, scope=ldap.SCOPE_BASE, attrs=['objectCategory'])[0]
+        if not cat:
+            return []
+
+        log.debug('get_category_schema: %s' % cat)
+        (_, res) = self.ldap_search(dn=cat['objectCategory'][0].decode('utf-8'), scope=ldap.SCOPE_BASE, attrs=['*'])[0]
+        if not res:
+            return []
+        else:
+            return res
 
 
     def get_object_classes(self, dn):
@@ -60,6 +82,14 @@ class AD(object):
         else:
             return map(lambda x: x[0], res)
 
+    def get_attrs(self, dn, attrs):
+        (_, res) = self.ldap_search(dn=dn, scope=ldap.SCOPE_BASE, attrs=attrs)[0]
+        if not res:
+            return []
+        else:
+            return res
+
+
     def get_root(self):
 #        (dn, res) = self.ldap_search(dn=r2dn(realm), scope=ldap.SCOPE_BASE, attrs=['*'])[0]
         res = self.ldap_search(dn=r2dn(self.realm), scope=ldap.SCOPE_ONELEVEL, attrs=['dn'])
@@ -72,7 +102,7 @@ class AD(object):
 
 
     def read_node(self, dn):
-        res = self.ldap_search(dn, scope=ldap.SCOPE_BASE, attrs=['*'])[0][1]
+        res = self.ldap_search(dn, scope=ldap.SCOPE_BASE, attrs=['*', 'nTSecurityDescriptor'])[0][1]
         return res
 
 

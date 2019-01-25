@@ -331,15 +331,13 @@ class ADfs(pyfuse3.Operations):
         if name == b'.attributes':
             dn = self.path2dn(self.get_inode_path(inode))[len(name)+1:]
             data = self.ad.read_node(dn)
-            data_ldif = io.StringIO()
-            lwr = ldif.LDIFWriter(data_ldif)
-            lwr.unparse(dn, dict(data))
-            data = data_ldif.getvalue()
+            data = self.res2ldif(dn, data)
         elif name == b'.schema':
             data = []
             dn = self.path2dn(self.get_inode_path(inode))[len(name)+1:]
             log.debug("determine attributes of %s" % dn)
             obj_classes = self.ad.get_object_classes(dn)
+            cat_schema = self.ad.get_category_schema(dn)
             log.debug("classes for %s: %s" % (dn, obj_classes))
             ocs = map(lambda x: str(x, 'utf-8'), obj_classes)
             oc_attrs = self.ad.schema.attribute_types(ocs)
@@ -352,6 +350,8 @@ class ADfs(pyfuse3.Operations):
             for ( oid, attr_obj ) in may_attrs.items():
                 data.append('%s' % attr_obj.names[0])
 
+            data.append('\n# object category schema\n')
+            data.append(self.res2ldif(dn, cat_schema))
             data = '\n'.join(data)
 
         if data:
@@ -360,6 +360,14 @@ class ADfs(pyfuse3.Operations):
             return len(data_out)
 
         return 0
+
+
+    def res2ldif(self, dn, res):
+        data = io.StringIO()
+        lwr = ldif.LDIFWriter(data, cols=80)
+        lwr.unparse(dn, dict(res))
+        data = data.getvalue()
+        return data
 
 
     async def read(self, fh, off, length):
