@@ -53,13 +53,18 @@ class AD(object):
         self.schema =  ldap.schema.SubSchema(sub_entry)
 
 
-    def get_category_schema(self, dn):
+    def get_node_category(self, dn):
         (_, cat) = self.ldap_search(dn=dn, scope=ldap.SCOPE_BASE, attrs=['objectCategory'])[0]
+        return cat['objectCategory'][0]
+
+
+    def get_category_schema(self, dn):
+        (_, cat) = self.get_node_category(dn)
         if not cat:
             return []
 
         log.debug('get_category_schema: %s' % cat)
-        (_, res) = self.ldap_search(dn=cat['objectCategory'][0].decode('utf-8'), scope=ldap.SCOPE_BASE, attrs=['*'])[0]
+        (_, res) = self.ldap_search(dn=cat.decode('utf-8'), scope=ldap.SCOPE_BASE, attrs=['*'])[0]
         if not res:
             return []
         else:
@@ -91,14 +96,8 @@ class AD(object):
 
 
     def get_root(self):
-#        (dn, res) = self.ldap_search(dn=r2dn(realm), scope=ldap.SCOPE_BASE, attrs=['*'])[0]
         res = self.ldap_search(dn=r2dn(self.realm), scope=ldap.SCOPE_ONELEVEL, attrs=['dn'])
         return map(lambda x: x[0], res)
-#        res = self.ldap_search(dn=r2dn(realm), scope=ldap.SCOPE_SUBTREE, attrs=['dn'])
-#        for r in res:
-#            (n,_) = r
-#            print(n)
-#        print(res)
 
 
     def read_node(self, dn):
@@ -106,10 +105,12 @@ class AD(object):
         return res
 
 
+    def move(self, old_dn, name, new_dn):
+        self.l.rename_s(old_dn, name, new_dn)
+
+
     def delete_node(self, dn):
         self.l.delete_s(dn)
-        log.debug("%s deleted" % dn)
-       #log.debug("delete %s: %s" % (dn, self.l.result()))
 
 
     def ldap_search(self, dn=None, expr=None, scope=ldap.SCOPE_SUBTREE, attrs=[]):
@@ -120,10 +121,9 @@ class AD(object):
             if not expr:
                 expr = '(objectClass=*)' # fix for old ldap (should accept None)
 
-            log.debug("ldap_search: (dn, scope, expr, attrs) (%s, %s, %s, %s)" % (dn, scope, expr, attrs))
             res = self.l.search_s(dn, scope, expr, attrs)
         except Exception as e:
-            print("search %s on %s failed with %s" % (expr, dn, e))
+            log.error("search %s on %s failed with %s" % (expr, dn, e))
             raise
 
         ret = [ (r, dn) for (r, dn) in res if r ]
@@ -142,8 +142,16 @@ class AD(object):
         return ret.pdc_dns_name
 
 
+    def mknode(self, dn, cn, objCat):
+        log.debug('mknode: %s (%s)' % (dn, objCat))
+        attrs = {}
+        attrs['objectCategory'] = [objCat.encode()]
+        attrs['objectClass'] = ['top'.encode(), 'container'.encode()]
+        attrs['cn'] = cn.encode()
+        self.l.add_s(dn, ldap.modlist.addModlist(attrs))
+
+
     def apply_diff(self, dn, diff):
-        log.debug('applying diff: %s' % diff)
         self.l.modify_s(dn, diff)
 
 
@@ -157,7 +165,6 @@ class AD(object):
         creds = Credentials()
         creds.guess(lp)
         if os.getuid() == 0 and root_use_machine_creds: # use machine credentials
-            debug('use machine account')
 #            creds.set_machine_account(lp)
             self.use_machine_creds = True
 

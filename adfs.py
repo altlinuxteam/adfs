@@ -10,6 +10,8 @@ from adldap import AD
 import ldif
 import ldap.modlist as modlist
 
+import bindings
+from bindings import domain, configuration, schema
 
 try:
     import faulthandler
@@ -28,20 +30,33 @@ else:
 #signal.signal(signal.SIGINT, keyboardInterruptHandler)
 log = logging.getLogger(__name__)
 
-def_dir_mode = stat.S_IFDIR | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH
-
 def r2dn(r):
     return ','.join(['DC=%s' % x for x in r.lower().split('.')])
 
-class ADfs(pyfuse3.Operations):
-#    def path2dn(self, path):
-#        return (self.realm)
 
+class ADfs(pyfuse3.Operations):
+    bindings = {'/': bindings.domain,
+                'CN=Configuration': bindings.configuration,
+                'CN=Configuration,CN=Schema': bindings.schema
+    }
+    handlers = {}
+#    bindings = {'/': bindings.domain,
+#                'CN=Configuration': bindings.configuration,
+#                'CN=Schema,CN=Configuration': bindings.schema
+#    }
+
+#    bindings = {'sysvol' : None,
+#                'configuration': None,
+#                'schema': None,
+#                'domain': None
+#    }
 
     def __init__(self):
         super(ADfs, self).__init__()
         self.realm = 'domain.alt'
         self.ad = AD(self.realm)
+        self.realmDN = r2dn(self.realm)
+        self.schemaDN = 'CN=Schema,CN=Configuration,%s' % self.realmDN
         self.cwd = r2dn(self.realm)
 
         #init sqlite
@@ -50,40 +65,118 @@ class ADfs(pyfuse3.Operations):
         self.db.row_factory = sqlite3.Row
         self.cursor = self.db.cursor()
         self.init_tables()
-        self.update_node('/')
+        self.init_handlers()
+        # init bindings
+#        for mp, b in self.bindings.items():
+#            log.debug('initialize binding: %s -> %s' % (mp, b.__name__))
+#            h = b.Handler()
+#            inode = self.bind(mp, h)
+#            self.handlers[inode] = h
+#            log.debug('%s initialized for %s' % (h.descr, mp))
+#        self.init_bindings()
+
+#        self.update_binding('domain')
+#        self.update_binding('configuration')
+#        self.update_binding('schema')
+#        for k,v in self.bindings.items():
+#            self.update_binding(k)
+
+    def init_handlers(self):
+        import pkgutil
+        import handlers
+        package = handlers
+        prefix = package.__name__ + "."
+        for importer, modname, ispkg in pkgutil.iter_modules(package.__path__, prefix):
+            if ispkg:
+                log.debug("skipping pakcage %s" % modname)
+                continue
+
+            log.debug("load handler %s" % modname)
+            m = __import__(modname, fromlist="dummy")
+            h = m.Impl(self.ad)
+            self.handlers[h.objCat] = h
 
 
-    def _update_root(self):
-        nodes = self.ad.get_childs(r2dn(self.realm))
-        for _n in nodes:
-            dn = str.encode(_n)[:-len(r2dn(self.realm))-1] # DN without realm's DN
-            cursor2 = self.db.cursor()
-            inode = cursor2.execute("SELECT inode FROM contents WHERE name=?", (dn,)).fetchone()
-            if inode: # node already exists
-                log.debug("skip inode: %s" % inode)
-                break
-            else:
-                log.debug("add %s to /" % dn)
-                now_ns = int(time() * 1e9)
-                self.cursor.execute("INSERT INTO inodes (uid, gid, mode, mtime_ns, atime_ns, ctime_ns, target, rdev) "
-                                    "VALUES (?,?,?,?,?,?,?,?)",
-                                    (os.getuid(), os.getgid(), stat.S_IFDIR | 0o755, now_ns, now_ns, now_ns, None, 0))
-                inode = self.cursor.lastrowid
-                self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (dn, inode, pyfuse3.ROOT_INODE))
-
-
-    def get_node_dn(self, inode_p, name):
-        inode = self.get_row("SELECT inode FROM contents WHERE parent_inode=? AND name=?", (inode_p, name))['inode']
-        path = self.get_inode_path(inode)
-        if name == b'.attributes' or name == b'.schema':
-            return self.path2dn(path)[len(name)+1:]
+    def bind(self, mountpoint, handler):
+        log.debug('bind: %s' %mountpoint)
+        if mountpoint == '/' or mountpoint == b'/':
+            p_inode = pyfuse3.ROOT_INODE
+            return p_inode
         else:
-            return self.path2dn(path)
+            p_inode = self.get_parent_inode(mountpoint)
+
+        attrs = self.mkpath(handler.bind_to)
+        log.debug('bind %s to %s' % (mountpoint, self.get_inode_name(p_inode)))
+        return attrs.st_ino
 
 
-    def get_inode_name(self, inode):
-        return self.get_row("SELECT name FROM contents WHERE inode=?", (inode,))['name']
+    def get_handler(self, objCat):
+        try:
+            return self.handlers[objCat]
+        except KeyError:
+            return self.handlers['CN=Container']
 
+
+    def refresh_inode(self, inode):
+        r = self.get_row('SELECT dn, objCat FROM inodes WHERE id=?', (inode,))
+        dn = r['dn'].decode('utf-8')
+        log.debug('************ objCat: %s' % r['objCat'])
+        objCat = self.ad.get_node_category(dn).decode('utf-8').split(',')[:1][0]
+
+        log.debug('objCat: %s' % objCat)
+#        try:
+#        except:
+#            objCat = r['objCat'].decode('utf-8')
+#            log.debug('refresh objCat %s not found: %s' % (dn, objCat))
+#        else:
+#            log.debug('refresh objCat %s from LDAP: %s' % (dn, objCat))
+#            self.db.execute('UPDATE inodes SET objCat=? WHERE id=?', (objCat,inode))
+
+        log.debug('refreshing %s, dn=%s, objCat=%s' % (self.get_inode_name(inode), dn, objCat))
+        h = self.get_handler(objCat)
+        if not (r['objCat'] == 'DELETED'):
+            for k,v in h.nodes.items():
+                path = self.get_inode_path(inode)
+                log.debug('update %s in %s' % (k, path))
+                try:
+                    sn_inode = self.get_inode('%s/%s' % (path, k))
+                except NoSuchRowError:
+                    log.debug('%s not exists in %s. creating...' % (k,path))
+                    attrs = self.mknode(k, v.mode, inode, dn, objCat)
+                    sn_inode = attrs.st_ino
+
+
+                data = v.read(dn, '%s,%s' % (objCat, self.schemaDN))
+                self.set_inode_data(sn_inode, data)
+
+        ldap_nodes = self.ad.get_childs(dn)
+        for n in ldap_nodes:
+            log.debug('refresh %s from LDAP' % n)
+            sn = n[:-len(dn)-1]
+            path = '%s/%s' % (self.get_inode_path(inode), sn)
+            if not self.is_exists(path):
+                log.debug('creating %s' % path)
+                self.mknode(sn, stat.S_IFDIR | 0o755, inode, n.encode(), self.get_objcat(n).encode())
+
+
+    def set_inode_data(self, inode, data):
+        d = data.encode()
+        size = len(d)
+        self.db.execute("UPDATE inodes SET data=?,size=? WHERE id=?", (d, size, inode))
+        return size
+
+
+    def get_parent_inode(self, path):
+        p_path = '/'.join(path.split('/')[:-1])
+        p_path = '/' if p_path == '' else p_path
+        return self.get_inode(p_path)
+
+
+    def update_binding(self, name):
+        inode = self.bindings[name].inode
+        log.debug("update %s (inode %s)" % (name, inode))
+        self.update_inode(inode, True, False)
+#        self.update_inode(inode, False, False)
 
     def get_inode_path(self, inode):
         path = []
@@ -94,89 +187,38 @@ class ADfs(pyfuse3.Operations):
             log.debug("adding %s to a path" % name)
             pinode = self.get_row("SELECT parent_inode FROM contents WHERE inode=?", (pinode,))['parent_inode']
 
-        return ('/' + '/'.join(path))
-#        return ('/' + '/'.join(reversed(path)))
-
+        return ('/' + '/'.join(reversed(path)))
 
     def path2dn(self, path):
+        path = self.normpath(path)
+        if path == '/' or path == b'/':
+            return r2dn(self.realm)
+
         log.debug('path2dn: %s' % path)
-        p = ','.join(path.split('/')[1:])
+        p = ','.join(reversed(path.split('/')[1:]))
         res = p + ',' + r2dn(self.realm)
         log.debug('path2dn (res): %s' % res)
         return res
 
+    def init_bindings(self):
+        import importlib
+        for k, v in self.bindings.items():
+            log.debug("load binding: %s" % k)
+            try:
+                mod = importlib.import_module('bindings.%s' % k)
+            except Exception as e:
+                raise NotImplementedError('binding %s not found. %s' % (k,e))
 
-    def update_node(self, node):
-        if node == '/': # update root (realm) node
-            self._update_root()
+            impl = mod.Handler()
+            log.debug("bind_to: %s" % impl.bind_to)
+            if impl.bind_to == '/':
+                log.debug("%s is root node" % k)
+                setattr(impl, 'inode', pyfuse3.ROOT_INODE)
+            else:
+                attrs = self.mkpath(impl.bind_to)
+                setattr(impl, 'inode', attrs.st_ino)
 
-
-    def update_inode(self, inode, force=False, delete_self_node=False):
-        if inode == pyfuse3.ROOT_INODE:
-            self._update_root()
-            return
-
-        if force:
-#            inodes = self.db.execute("SELECT inode FROM contents WHERE parent_inode=?", (inode,)).fetchone()
-#            log.debug("force deliting nodes: %s" % list(inodes))
-            self.db.execute("DELETE FROM inodes WHERE id IN (SELECT inode FROM contents WHERE parent_inode=?)", (inode,))
-            self.db.execute("DELETE FROM contents WHERE parent_inode=?", (inode,))
-            if delete_self_node:
-                self.db.execute("DELETE FROM inodes WHERE id=?", (inode,))
-                self.db.execute("DELETE FROM contents WHERE inode=?", (inode,))
-
-            childs = []
-        else:
-            childs = self.db.execute("SELECT * FROM contents WHERE parent_inode=?", (inode,)).fetchone()
-
-#            self.db.execute(query, inodes)
-
-        # try to get children from cache
-        if not childs and not delete_self_node: # update cache from AD
-            cwd = self.get_inode_path(inode)
-            log.debug('cwd: %s' % cwd)
-            pdn = self.path2dn(cwd) # parent dn
-            log.debug('pdn: %s' % pdn)
-            dns = self.ad.get_childs(pdn)
-            now_ns = int(time() * 1e9)
-
-            # insert attributes file
-            log.debug("add attributes to %s" % pdn)
-            name = b'.attributes'
-            cursor2 = self.db.cursor()
-            cursor2.execute("INSERT INTO inodes (uid, gid, mode, mtime_ns, atime_ns, ctime_ns, target, rdev) "
-                            "VALUES (?,?,?,?,?,?,?,?)",
-                            (os.getuid(), os.getgid(), stat.S_IFREG | 0o644, now_ns, now_ns, now_ns, None, 0))
-            attrs_inode = cursor2.lastrowid
-            log.debug("insert new record: (name, inode, parent_inode) (%s, %s, %s)" % (name, attrs_inode, inode))
-            self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (name, attrs_inode, inode))
-            data_len = self.update_inode_data(attrs_inode)
-            self.db.execute("UPDATE inodes SET size=? WHERE id=?", (data_len, attrs_inode))
-
-            # insert schema definitions for class
-            log.debug("add schema definition to %s" % pdn)
-            name = b'.schema'
-            cursor2.execute("INSERT INTO inodes (uid, gid, mode, mtime_ns, atime_ns, ctime_ns, target, rdev) "
-                            "VALUES (?,?,?,?,?,?,?,?)",
-                            (os.getuid(), os.getgid(), stat.S_IFREG | 0o444, now_ns, now_ns, now_ns, None, 0))
-            attrs_inode = cursor2.lastrowid
-            log.debug("insert new record: (name, inode, parent_inode) (%s, %s, %s)" % (name, attrs_inode, inode))
-            self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (name, attrs_inode, inode))
-            data_len = self.update_inode_data(attrs_inode)
-            self.db.execute("UPDATE inodes SET size=? WHERE id=?", (data_len, attrs_inode))
-
-
-            for dn in dns: # insert node to the cache
-                log.debug("add %s to %s" % (pdn, dn))
-                name = str.encode(dn)[:-len(pdn)-1]
-                self.cursor.execute("INSERT INTO inodes (uid, gid, mode, mtime_ns, atime_ns, ctime_ns, target, rdev) "
-                                    "VALUES (?,?,?,?,?,?,?,?)",
-                                    (os.getuid(), os.getgid(), stat.S_IFDIR | 0o755, now_ns, now_ns, now_ns, None, 0))
-                c_inode = self.cursor.lastrowid
-                log.debug("insert new record: (name, inode, parent_inode) (%s, %s, %s)" % (name, c_inode, inode))
-                self.db.execute("INSERT INTO contents (name, inode, parent_inode) VALUES (?,?,?)", (name, c_inode, inode))
-        else:
-            log.debug("skip updating %s" % inode)
+            self.bindings[k] = impl
 
 
     def init_tables(self):
@@ -192,7 +234,9 @@ class ADfs(pyfuse3.Operations):
           target         BLOB(256),
           size           INT NOT NULL DEFAULT 0,
           rdev           INT NOT NULL DEFAULT 0,
-          data           BLOB
+          data           BLOB,
+          dn             BLOB,
+          objCat         BLOB(256)
         )""")
 
         self.cursor.execute("""
@@ -206,26 +250,22 @@ class ADfs(pyfuse3.Operations):
         )""")
 
         # insert root dir
+        dn = r2dn(self.realm)
+        objCat = self.get_objcat(dn)
+        log.debug("create root %s of %s" % (dn, objCat))
         now_ns = int(time() * 1e9)
-        self.cursor.execute("INSERT INTO inodes (id,mode,uid,gid,mtime_ns,atime_ns,ctime_ns) "
-                            "VALUES (?,?,?,?,?,?,?) ",
-                            (pyfuse3.ROOT_INODE, stat.S_IFDIR |
-                             stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR |
-                             stat.S_IRGRP | stat.S_IWGRP | stat.S_IXGRP |
-                             stat.S_IROTH | stat.S_IWOTH | stat.S_IXOTH ,
-                             os.getuid(), os.getgid(), now_ns, now_ns, now_ns))
+        self.cursor.execute("INSERT INTO inodes (id,mode,uid,gid,mtime_ns,atime_ns,ctime_ns,dn,objCat) "
+                            "VALUES (?,?,?,?,?,?,?,?,?) ",
+                            (pyfuse3.ROOT_INODE, stat.S_IFDIR | 0o755,
+                             os.getuid(), os.getgid(), now_ns, now_ns, now_ns, dn.encode(), objCat.encode()))
 
         self.cursor.execute("INSERT INTO contents (name, parent_inode, inode) VALUES(?,?,?)",
                             (b'..', pyfuse3.ROOT_INODE, pyfuse3.ROOT_INODE))
 
-        # node for configuration branch
-        self.cursor.execute("INSERT INTO inodes (mode,uid,gid,mtime_ns,atime_ns,ctime_ns) "
-                            "VALUES (?,?,?,?,?,?) ",
-                            (stat.S_IFDIR | 0o755,
-                             os.getuid(), os.getgid(), now_ns, now_ns, now_ns))
-        cid = self.cursor.lastrowid
-        self.cursor.execute("INSERT INTO contents (name, parent_inode, inode) VALUES(?,?,?)",
-                            (b'CN=Configuration', pyfuse3.ROOT_INODE, cid))
+
+    def get_objcat(self, dn):
+        objCat = self.ad.get_attrs(dn, ['objectCategory'])['objectCategory'][0]
+        return objCat.decode('utf-8')[:-len('CN=Schema,CN=Configuration,%s' % r2dn(self.realm))-1]
 
 
     def get_row(self, *a, **kw):
@@ -244,7 +284,7 @@ class ADfs(pyfuse3.Operations):
         return row
 
 
-    async def getattr(self, inode, ctx=None):
+    def getattr_sync(self, inode, ctx=None):
         try:
             row = self.get_row("SELECT * FROM inodes WHERE id=?", (inode,))
         except NoSuchRowError:
@@ -271,7 +311,14 @@ class ADfs(pyfuse3.Operations):
 
         return entry
 
+
+    async def getattr(self, inode, ctx=None):
+        return self.getattr_sync(inode, ctx)
+
+
     async def lookup(self, inode_p, name, ctx=None):
+        log.debug('lookup for %s in %s' % (name, self.get_inode_path(inode_p)))
+        self.refresh_inode(inode_p)
         if name == '.':
             inode = inode_p
         elif name == '..':
@@ -290,17 +337,13 @@ class ADfs(pyfuse3.Operations):
 
 
     async def opendir(self, inode, ctx):
+        self.refresh_inode(inode)
         return inode
 
 
     async def readdir(self, inode, off, token):
         if off == 0:
             off = -1
-
-        try:
-            self.update_inode(inode)
-        except NoSuchRowError:
-            raise(pyfuse3.FUSEError(errno.ENOENT))
 
         cursor2 = self.db.cursor()
         cursor2.execute("SELECT * FROM contents WHERE parent_inode=? AND rowid > ? ORDER BY rowid", (inode,off))
@@ -313,76 +356,57 @@ class ADfs(pyfuse3.Operations):
         return inode
 
 
-    def get_inode_dn(self, inode):
-        iname = self.get_inode_name(inode)
-        log.debug('iname: %s' % iname)
-        if iname == b'.attributes':
-            return self.path2dn(self.get_inode_path(inode))[len('.attributes')+1:]
-        elif iname == b'.schema':
-            return self.path2dn(self.get_inode_path(inode))[len('.schema')+1:]
-        else:
-            return self.path2dn(self.get_inode_path(inode))
-
-
-    def update_inode_data(self, inode):
-        name = self.get_inode_name(inode)
-        data = None
-        log.debug('updating %s (%s)' % (name, inode))
-        if name == b'.attributes':
-            dn = self.path2dn(self.get_inode_path(inode))[len(name)+1:]
-            data = self.ad.read_node(dn)
-            data = self.res2ldif(dn, data)
-        elif name == b'.schema':
-            data = []
-            dn = self.path2dn(self.get_inode_path(inode))[len(name)+1:]
-            log.debug("determine attributes of %s" % dn)
-            obj_classes = self.ad.get_object_classes(dn)
-            cat_schema = self.ad.get_category_schema(dn)
-            log.debug("classes for %s: %s" % (dn, obj_classes))
-            ocs = map(lambda x: str(x, 'utf-8'), obj_classes)
-            oc_attrs = self.ad.schema.attribute_types(ocs)
-            must_attrs = oc_attrs[0]
-            may_attrs = oc_attrs[1]
-            data.append('\n# MUST HAVE attributes')
-            for ( oid, attr_obj ) in must_attrs.items():
-                data.append('%s' % attr_obj.names[0])
-            data.append('\n# MAY HAVE attributes')
-            for ( oid, attr_obj ) in may_attrs.items():
-                data.append('%s' % attr_obj.names[0])
-
-            data.append('\n# object category schema\n')
-            data.append(self.res2ldif(dn, cat_schema))
-            data = '\n'.join(data)
-
-        if data:
-            data_out = ('# DN: %s\n%s' % (dn, data)).encode()
-            self.db.execute("UPDATE inodes SET data=? WHERE id=?", (data_out, inode))
-            return len(data_out)
-
-        return 0
-
-
-    def res2ldif(self, dn, res):
-        data = io.StringIO()
-        lwr = ldif.LDIFWriter(data, cols=80)
-        lwr.unparse(dn, dict(res))
-        data = data.getvalue()
-        return data
-
-
     async def read(self, fh, off, length):
         log.debug('open %s file (off, length) (%s, %s)' % (fh, off, length))
         data = self.get_row('SELECT data FROM inodes WHERE id=?', (fh,))[0]
         if data is None:
             return b''
 
-        log.debug('data is: %s' % data)
+#        log.debug('data is: %s' % data)
         return data[off:off+length]
+
+
+    def _create(self, inode_p, name, mode, ctx=None, rdev=0, target=None):
+        log.debug("creating %s" % name)
+        if not ctx:
+            ctx = lambda: None
+            ctx.uid = os.getuid()
+            ctx.gid = os.getgid()
+
+        if (self.getattr_sync(inode_p)).st_nlink == 0:
+            log.warn('Attempted to create entry %s with unlinked parent %d',
+                     name, inode_p)
+            raise FUSEError(errno.EINVAL)
+
+        now_ns = int(time() * 1e9)
+        self.cursor.execute('INSERT INTO inodes (uid, gid, mode, mtime_ns, atime_ns, '
+                            'ctime_ns, target, rdev) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                            (ctx.uid, ctx.gid, mode, now_ns, now_ns, now_ns, target, rdev))
+
+        inode = self.cursor.lastrowid
+        self.db.execute("INSERT INTO contents(name, inode, parent_inode) VALUES(?,?,?)",
+                        (name, inode, inode_p))
+        log.debug("%s created" % name)
+        return self.getattr_sync(inode)
+
+
+    async def mkdir(self, inode_p, name, mode, ctx):
+        dn = '%s,%s' % (name.decode('utf-8'), self.path2dn(self.get_inode_path(inode_p)))
+        if name.decode('utf-8').split('=')[0] == 'OU':
+            objCat = 'CN=Organizational-Unit'
+        else:
+            objCat = 'CN=Container'
+
+        attrs = self.mknode(name.decode('utf-8'), stat.S_IFDIR | 0o755, inode_p, dn.encode(), objCat.encode())
+        self.ad.mknode(dn, name.decode('utf-8').split('=')[1], '%s,%s' % (objCat, self.schemaDN))
+        return attrs
 
 
     async def write(self, fh, offset, buf):
         log.debug("write (fh, offset, buf) (%s, %s, %s)" % (fh, offset, buf))
-        data_old = self.get_row('SELECT data FROM inodes WHERE id=?', (fh,))[0]
+        res = self.get_row('SELECT data, objCat FROM inodes WHERE id=?', (fh,))
+        data_old = res['data']
+        objCat = res['objCat']
         log.debug("old len: %s" % len(data_old))
         log.debug("buf len: %s" % len(buf))
         if data_old is None:
@@ -393,21 +417,18 @@ class ADfs(pyfuse3.Operations):
 #        data_new = data_old[:offset] + buf + data_old[offset+len(buf):]
         log.debug("data_new: %s" % data_new)
 
-        dn = self.get_inode_dn(fh)
-        dict_old = ldif.LDIFRecordList(io.StringIO(data_old.decode('utf-8')))
-        dict_old.parse()
-        log.debug("dict_old: %s" % dict_old.all_records)
-        dict_new = ldif.LDIFRecordList(io.StringIO(data_new.decode('utf-8')))
-        dict_new.parse()
-        log.debug("dict_new: %s" % dict_new.all_records)
-        _ldif = modlist.modifyModlist(dict_old.all_records[0][1], dict_new.all_records[0][1])
-        log.debug("_ldif: %s" % _ldif)
-        self.ad.apply_diff(dn, _ldif)
-        self.update_inode_data(fh)
+        h = self.get_handler(objCat)
+        path = self.get_inode_path(fh)
+        name = self.get_inode_name(fh)
+        dn = self.path2dn(path)[len(name)+1:]
+        h.write(name, dn, data_old, buf)
+        p_inode = self.get_parent_inode(path)
+        self.refresh_inode(p_inode)
         return len(buf)
 
 
     async def unlink(self, inode_p, name,ctx):
+        log.debug('unlink: %s (parent %s)' % (name, self.get_inode_path(inode_p)))
         entry = await self.lookup(inode_p, name)
 
         if stat.S_ISDIR(entry.st_mode):
@@ -427,27 +448,204 @@ class ADfs(pyfuse3.Operations):
 
 
     def _remove(self, inode_p, name, entry):
-        if name == b'.attributes':
-            try:
-                dn = self.get_node_dn(inode_p, name)
-                log.debug("going to delete %s" % dn)
-                self.ad.delete_node(dn)
-            except Exception as e:
-                log.error("cannot delete DN: %s (%s)" % (dn,e))
-                raise pyfuse3.FUSEError(errno.EIO)
-            self.update_inode(inode_p, force=True, delete_self_node=True)
-
         if self.get_row("SELECT COUNT(inode) FROM contents WHERE parent_inode=?",
                         (entry.st_ino,))[0] > 0:
             raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+
+        if stat.S_ISDIR(entry.st_mode ):
+            dn = self.path2dn(self.get_inode_path(entry.st_ino))
+            self.ad.delete_node(dn)
 
         self.cursor.execute("DELETE FROM contents WHERE name=? AND parent_inode=?",
                             (name, inode_p))
 
         self.cursor.execute("DELETE FROM inodes WHERE id=?", (entry.st_ino,))
+        log.debug("SET objCat as DELETED for inode %s" % inode_p)
+        self.cursor.execute("UPDATE inodes SET objCat=? WHERE id=?", ('DELETED', inode_p))
 #        if entry.st_nlink == 1 and entry.st_ino not in self.inode_open_count:
 #            self.cursor.execute("DELETE FROM inodes WHERE id=?", (entry.st_ino,))
 
+
+    async def rename(self, inode_p_old, name_old, inode_p_new, name_new,
+                     flags, ctx):
+        if flags != 0:
+            raise FUSEError(errno.EINVAL)
+
+        entry_old = await self.lookup(inode_p_old, name_old)
+
+        try:
+            entry_new = await self.lookup(inode_p_new, name_new)
+        except pyfuse3.FUSEError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+            target_exists = False
+        else:
+            target_exists = True
+
+        if target_exists:
+            # replace is not implemented yet
+            self._replace(inode_p_old, name_old, inode_p_new, name_new,
+                          entry_old, entry_new)
+        else:
+            new_path = self.get_inode_path(inode_p_new)
+            new_dn = self.path2dn(new_path)
+            old_path = self.get_inode_path(entry_old.st_ino)
+            old_dn = self.path2dn(old_path)
+            self.ad.move(old_dn, name_new.decode('utf-8'), new_dn)
+            self.cursor.execute("UPDATE contents SET name=?, parent_inode=? WHERE name=? "
+                                "AND parent_inode=?", (name_new, inode_p_new,
+                                                       name_old, inode_p_old))
+
+
+    def normpath(self, path):
+        path = '/' + path.lstrip('/')
+        log.debug('%s -> %s' % (path, os.path.normpath(path)))
+        return os.path.normpath(path)
+
+
+    def get_inode(self, path):
+        path = self.normpath(path)
+        log.debug('get_inode: %s' % path)
+        p_inode = pyfuse3.ROOT_INODE
+        if path == '/':
+            return p_inode
+
+        log.debug("search inode for %s" % (path,))
+        for p in path.split('/')[1:]:
+            log.debug('part: %s, p_inode: %s' % (p, p_inode))
+            p_inode = self.get_row("SELECT inode FROM contents WHERE name=? AND parent_inode=?", (p.encode(), p_inode))['inode']
+
+        return p_inode
+
+
+    def get_inode_name(self, inode):
+        if inode == pyfuse3.ROOT_INODE:
+            return '/'
+
+        return self.get_row("SELECT name FROM contents WHERE inode=?", (inode,))['name']
+
+
+    def is_exists(self, path):
+        path = self.normpath(path)
+        log.debug("[is_exists] %s" % (path))
+        if path == '/': # root must exists
+            return True
+
+        p_inode = pyfuse3.ROOT_INODE
+        for p in path.split('/')[1:]:
+            if self.get_inode_name(p_inode) == b'..':
+                continue
+
+            log.debug("[is_exists] search for %s in %s" % (p, self.get_inode_name(p_inode)))
+            try:
+                p_inode = self.get_row("SELECT inode FROM contents WHERE name=? AND parent_inode=?", (p.encode(), p_inode))['inode']
+            except NoSuchRowError:
+                return False
+
+        return True
+
+
+    def is_dir(self, path):
+        path = self.normpath(path)
+        if path == '/':
+            return True
+
+        log.debug('check is_dir for %s' % path)
+        inode = self.get_inode(path)
+        mode = self.get_row("SELECT mode FROM inodes WHERE id=?", (inode,))['mode']
+        return (stat.S_ISDIR(mode))
+
+
+    def is_contains(self, path, name):
+        path = self.normpath(path)
+        try:
+            self.get_inode('/'.join([path, name]))
+        except NoSuchRowError:
+            return False
+
+        return True
+
+
+    def _check_mk_validity(self, path, name):
+        path = self.normpath(path)
+        log.debug('check validity for %s' % path)
+        if not self.is_exists(path):
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        if not self.is_dir(path):
+            raise pyfuse3.FUSEError(errno.ENOTDIR)
+
+        if self.is_contains(path, name):
+            raise pyfuse3.FUSEError(errno.EEXIST)
+
+
+    def _vcreate(self, path, name, mode):
+        path = self.normpath(path)
+        inode = self.get_inode(path)
+        if not inode:
+            log.error("inode for %s not found" % (path))
+
+        log.debug("inode for %s is %s" % (path, inode))
+        return self._create(inode, name.encode(), mode)
+
+
+    def mkvdir(self, path, name):
+        log.debug("creating vdir %s in %s" % (name, path))
+        self._check_mk_validity(path, name)
+        return self._vcreate(path, name, stat.S_IFDIR | 0o755)
+
+
+    def mkvfile(self, path, name):
+        log.debug("creating vfile %s in %s" % (name, path))
+        self._check_mk_validity(path, name)
+        return self._vcreate(path, name, stat.S_IFREG | 0o644)
+
+
+    def mknode(self, name, mode, p_inode, dn, objCat):
+        now_ns = int(time() * 1e9)
+        self.cursor.execute("INSERT INTO inodes (mode,uid,gid,mtime_ns,atime_ns,ctime_ns,dn,objCat) "
+                            "VALUES (?,?,?,?,?,?,?,?) ",
+                            (mode, os.getuid(), os.getgid(), now_ns, now_ns, now_ns, dn, objCat))
+
+        inode = self.cursor.lastrowid
+        self.cursor.execute("INSERT INTO contents (name, parent_inode, inode) VALUES(?,?,?)",
+                            (name.encode(), p_inode, inode))
+
+        return self.getattr_sync(inode)
+
+
+    def mkpath(self, path):
+        path = self.normpath(path)
+        if path == '/':
+            return self.getattr_sync(pyfuse3.ROOT_INODE)
+
+        dirs = path.split('/')[1:-1]
+        ppath = '/'
+        for d in dirs:
+            if ppath == '/':
+                continue
+
+            try:
+                self._check_mk_validity(ppath, d)
+            except pyfuse3.FUSEError(errno.EEXIST):
+                pass
+            else:
+                self._vcreate(ppath, d, stat.S_IFDIR | 0o755)
+            ppath = ppath + '/' + d
+
+
+        last_node = '/'.join(path.split('/')[-1:])
+        ppath = '/'.join(path.split('/')[:-1])
+        self._check_mk_validity(ppath, last_node)
+        return self._vcreate(ppath, last_node, stat.S_IFDIR | 0o755)
+
+
+    def res2ldif(self, dn, res):
+        data = io.StringIO()
+        lwr = ldif.LDIFWriter(data, cols=80)
+        lwr.unparse(dn, dict(res))
+        data = data.getvalue()
+        return data
 
 def init_logging(debug=False):
     formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(threadName)s: '
