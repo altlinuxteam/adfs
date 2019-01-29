@@ -25,6 +25,8 @@ class AD(object):
     def __init__(self, realm):
         self.realm = realm
         self.realmDN = r2dn(self.realm)
+        self.configurationDN = 'CN=Configuration,%s' % self.realmDN
+        self.schemaDN = 'CN=Schema,%s' % self.configurationDN
         self.WKDN = dict((k,'%s,%s' % (v,self.realmDN)) for k, v in self.WKDN.items())
         self.WKDN['realm'] = self.realmDN
         debug("initialize LDAP")

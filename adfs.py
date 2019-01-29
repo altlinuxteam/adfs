@@ -195,6 +195,7 @@ class ADfs(pyfuse3.Operations):
         if path == '/' or path == b'/':
             return r2dn(self.realm)
 
+        path = '/'.join([ x.split('(')[0].strip() for x in path.split('/')])
         log.debug('path2dn: %s' % path)
         p = ','.join(reversed(path.split('/')[1:]))
         res = p + ',' + r2dn(self.realm)
@@ -392,14 +393,16 @@ class ADfs(pyfuse3.Operations):
 
 
     async def mkdir(self, inode_p, name, mode, ctx):
-        dn = '%s,%s' % (name.decode('utf-8'), self.path2dn(self.get_inode_path(inode_p)))
-        if name.decode('utf-8').split('=')[0] == 'OU':
-            objCat = 'CN=Organizational-Unit'
-        else:
-            objCat = 'CN=Container'
+        name = name.decode('utf-8')
+        nodeName = name.split('(')[0].strip()
+        objCat = name.split('(')[1].rstrip(')')
 
-        attrs = self.mknode(name.decode('utf-8'), stat.S_IFDIR | 0o755, inode_p, dn.encode(), objCat.encode())
-        self.ad.mknode(dn, name.decode('utf-8').split('=')[1], '%s,%s' % (objCat, self.schemaDN))
+        dn = '%s,%s' % (nodeName, self.path2dn(self.get_inode_path(inode_p)))
+
+        attrs = self.mknode(name, stat.S_IFDIR | 0o755, inode_p, dn.encode(), objCat.encode())
+        h = self.handlers['CN=%s' % objCat]
+        h.create(dn, objCat)
+#        self.ad.mknode(dn, nodeName.split('=')[1], '%s,%s' % (objCat, self.schemaDN))
         return attrs
 
 

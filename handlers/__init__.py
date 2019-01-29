@@ -80,6 +80,7 @@ class Handler(object):
                      '.schema': Schema(ldap),
         }
         self._mods = {'dummy': self.__dummy__}
+        self.ldap = ldap
 
 
     def safeDecode(self, xs):
