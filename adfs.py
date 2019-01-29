@@ -153,7 +153,8 @@ class ADfs(pyfuse3.Operations):
         for n in ldap_nodes:
             log.debug('refresh %s from LDAP' % n)
             objCat = self.ad.get_node_category(n).decode('utf-8')[:-len(self.schemaDN)-1]
-            sn = '%s (%s)' % (n[:-len(dn)-1], objCat[3:])
+#            sn = '%s (%s)' % (n[:-len(dn)-1], objCat[3:])
+            sn = '%s' % n[:-len(dn)-1]
             path = '%s/%s' % (self.get_inode_path(inode), sn)
             if not self.is_exists(path):
                 log.debug('creating %s' % path)
@@ -195,7 +196,7 @@ class ADfs(pyfuse3.Operations):
         if path == '/' or path == b'/':
             return r2dn(self.realm)
 
-        path = '/'.join([ x.split('(')[0].strip() for x in path.split('/')])
+#        path = '/'.join([ x.split('(')[0].strip() for x in path.split('/')])
         log.debug('path2dn: %s' % path)
         p = ','.join(reversed(path.split('/')[1:]))
         res = p + ',' + r2dn(self.realm)
@@ -391,16 +392,34 @@ class ADfs(pyfuse3.Operations):
         log.debug("%s created" % name)
         return self.getattr_sync(inode)
 
+#    async def setattr(self, inode, attr, fields, fh, ctx):
+#        return await self.getattr(pyfuse3.ROOT_INODE)
+
+    def get_inode_handler(self, inode):
+        res = self.get_row("SELECT objCat FROM inodes WHERE id=?", (inode,))
+        return self.handlers[res['objCat'].decode('utf-8')]
+
+#    async def mknod(self, inode_p, name, mode, rdev, ctx):
+#        log.debug('mknod')
+#        return (pyfuse3.ROOT_INODE, await self.getattr(pyfuse3.ROOT_INODE))
+
+    async def create(self, inode_parent, name, mode, flags, ctx):
+        log.debug('create %s' % name.decode('utf-8'))
+        h = self.get_inode_handler(inode_parent)
+#        return pyfuse3.ROOT_INODE
+        return (pyfuse3.ROOT_INODE, await self.getattr(pyfuse3.ROOT_INODE))
 
     async def mkdir(self, inode_p, name, mode, ctx):
-        name = name.decode('utf-8')
-        nodeName = name.split('(')[0].strip()
-        objCat = name.split('(')[1].rstrip(')')
+        dn = '%s,%s' % (name.decode('utf-8'), self.path2dn(self.get_inode_path(inode_p)))
+        if name.decode('utf-8').split('=')[0] == 'OU':
+            objCat = 'CN=Organizational-Unit'
+        else:
+            objCat = 'CN=Container'
 
-        dn = '%s,%s' % (nodeName, self.path2dn(self.get_inode_path(inode_p)))
+        attrs = self.mknode(name.decode('utf-8'), stat.S_IFDIR | 0o755, inode_p, dn.encode(), objCat.encode())
+#        self.ad.mknode(dn, name.decode('utf-8').split('=')[1], '%s,%s' % (objCat, self.schemaDN))
 
-        attrs = self.mknode(name, stat.S_IFDIR | 0o755, inode_p, dn.encode(), objCat.encode())
-        h = self.handlers['CN=%s' % objCat]
+        h = self.handlers[objCat]
         h.create(dn, objCat)
 #        self.ad.mknode(dn, nodeName.split('=')[1], '%s,%s' % (objCat, self.schemaDN))
         return attrs
@@ -425,7 +444,12 @@ class ADfs(pyfuse3.Operations):
         path = self.get_inode_path(fh)
         name = self.get_inode_name(fh)
         dn = self.path2dn(path)[len(name)+1:]
-        h.write(name, dn, data_old, buf)
+        newCat = h.write(name, dn, data_old, buf)
+        if newCat:
+            h = self.get_handler(newCat)
+            h.replace(dn)
+#            newCat = h.write(name, dn, data_old, buf)
+
         p_inode = self.get_parent_inode(path)
         self.refresh_inode(p_inode)
         return len(buf)
@@ -495,7 +519,9 @@ class ADfs(pyfuse3.Operations):
             new_dn = self.path2dn(new_path)
             old_path = self.get_inode_path(entry_old.st_ino)
             old_dn = self.path2dn(old_path)
-            self.ad.move(old_dn, name_new.decode('utf-8'), new_dn)
+            node_name = name_new.decode('utf-8').split('(')[0].strip()
+            log.debug('move node %s to %s' % (old_dn, new_dn))
+            self.ad.move(old_dn, node_name, new_dn)
             self.cursor.execute("UPDATE contents SET name=?, parent_inode=? WHERE name=? "
                                 "AND parent_inode=?", (name_new, inode_p_new,
                                                        name_old, inode_p_old))

@@ -40,6 +40,9 @@ class VNode(object):
 #        log.debug('_read: %s' % raw_data)
         return self._raw2ldif(dn, raw_data)
 
+    def write(self, *args, **kwargs):
+        return None
+
 
 class Schema(VNode):
     def __init__(self, ldap):
@@ -47,9 +50,6 @@ class Schema(VNode):
         self.ldap = ldap
         self.attrs = ['*']
         super(Schema, self).__init__('schema', self.mode, self.ldap, self.attrs)
-
-    def write(self, dn, old_data, new_data):
-        pass
 
 
 class Attrs(VNode):
@@ -68,8 +68,17 @@ class Attrs(VNode):
         new_dict.parse()
         log.debug("dict_new: %s" % new_dict.all_records)
         _ldif = modlist.modifyModlist(old_dict.all_records[0][1], new_dict.all_records[0][1])
+        if (1, 'objectCategory', None) in _ldif:
+            (_, o) = old_dict.all_records[0]
+            (_, n) = new_dict.all_records[0]
+            cat_old = o['objectCategory'][0].decode('utf-8')[:-len(self.ldap.schemaDN)-1]
+            cat_new = n['objectCategory'][0].decode('utf-8')[:-len(self.ldap.schemaDN)-1]
+            log.debug('objectCategory changed for %s (%s -> %s)' % (dn, cat_old, cat_new))
+            return cat_new
+
         log.debug("_ldif: %s" % _ldif)
         self.ldap.apply_diff(dn, _ldif)
+        return None
 
 
 class Handler(object):

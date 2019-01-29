@@ -1,5 +1,7 @@
-import stat, logging
-from handlers import Handler, VNode
+import io, stat, logging
+from handlers import Handler, VNode, log
+import ldif
+import ldap.modlist as modlist
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +28,8 @@ class Create(VNode):
         self.ldap.delete_s(dn)
         self.ldap.add_s(dn, attrs)
 
+    def write(self, *args, **kwargs):
+        return None
 
 class Impl(Handler):
     objCat = 'CN=Person'
@@ -44,3 +48,10 @@ class Impl(Handler):
             ('sAMAccountName', name.encode())
         ]
         self.ldap.l.add_s(dn, attrs)
+
+    def replace(self, dn):
+#        attrs = ldif.LDIFRecordList(io.StringIO(buf.decode('utf-8')))
+#        attrs.parse()
+        log.debug('replacing %s' % dn)
+        self.ldap.l.delete_s(dn)
+        self.create(dn, self.objCat)
