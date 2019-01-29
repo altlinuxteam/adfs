@@ -152,7 +152,8 @@ class ADfs(pyfuse3.Operations):
         ldap_nodes = self.ad.get_childs(dn)
         for n in ldap_nodes:
             log.debug('refresh %s from LDAP' % n)
-            sn = n[:-len(dn)-1]
+            objCat = self.ad.get_node_category(n).decode('utf-8')[:-len(self.schemaDN)-1]
+            sn = '%s (%s)' % (n[:-len(dn)-1], objCat[3:])
             path = '%s/%s' % (self.get_inode_path(inode), sn)
             if not self.is_exists(path):
                 log.debug('creating %s' % path)
